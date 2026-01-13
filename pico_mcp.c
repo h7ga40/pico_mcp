@@ -19,6 +19,9 @@
 #define HTTP_NEWLINE "\r\n"
 #define SSE_NEWLINE "\n"
 #define SSE_SEPARATOR "\n"
+#define ATX_PWR_SW_GPIO 2
+#define ATX_PWR_SW_ACTIVE_LEVEL 0
+#define ATX_PWR_SW_PULSE_MS 200
 
 enum endpoint_type {
 	ENDPOINT_NONE,
@@ -47,7 +50,7 @@ typedef struct session_info {
 static session_info_t *head = NULL;
 static char hostname[sizeof(CYW43_HOST_NAME) + 4];
 static int response_id = 1;
-static bool led_on = false;
+static bool pulse_in_progress = false;
 
 static int on_method(llhttp_t *parser, const char *at, size_t length);
 static int on_method_complete(llhttp_t *parser);
@@ -170,28 +173,32 @@ static char *get_query_value(const char *query, const char *key) {
 	return NULL; // 見つからない場合
 }
 
-static void switch_led(const char *val)
+static void init_atx_power_gpio(void)
 {
-	if (!val) {
-		return;
-	}
+	gpio_init(ATX_PWR_SW_GPIO);
+	gpio_set_dir(ATX_PWR_SW_GPIO, GPIO_OUT);
+	gpio_put(ATX_PWR_SW_GPIO, !ATX_PWR_SW_ACTIVE_LEVEL);
+	// ATX PWR_SWは短絡で動作するため、トランジスタ/フォトカプラ等で絶縁推奨。
+}
 
-	if (strcasecmp(val, "on") == 0) {
-		led_on = true;
-	} else if (strcasecmp(val, "off") == 0) {
-		led_on = false;
+static bool atx_power_pulse(void)
+{
+	if (pulse_in_progress) {
+		return false;
 	}
+	pulse_in_progress = true;
 
-	cyw43_gpio_set(&cyw43_state, 0, led_on);
+	gpio_put(ATX_PWR_SW_GPIO, ATX_PWR_SW_ACTIVE_LEVEL);
+	sleep_ms(ATX_PWR_SW_PULSE_MS);
+	gpio_put(ATX_PWR_SW_GPIO, !ATX_PWR_SW_ACTIVE_LEVEL);
+
+	pulse_in_progress = false;
+	return true;
 }
 
 const char *get_switch_state()
 {
-	if (led_on) {
-		return "on";
-	} else {
-		return "off";
-	}
+	return "pulse";
 }
 
 static void session_info_free(session_info_t *info)
@@ -380,6 +387,7 @@ int response_printf(session_info_t *info, const char *format, ...)
 const char invalid_request[] = "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":-32600,\"message\":\"Invalid Request\"}}";
 const char method_not_found[] = "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}";
 const char location_not_configured[] = "{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32001, \"message\": \"Location not configured\"}, \"id\": %d}";
+const char pulse_busy[] = "{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32002, \"message\": \"Power pulse busy\"}, \"id\": %d}";
 const char unknown_tool[] = "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":-32602,\"message\":\"Unknown tool\"}}";
 const char invalid_protocol[] = "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":-32602,\"message\":\"Invalid protocol version\"}}";
 const char invalid_context[] = "{\"jsonrpc\": \"2.0\", \"error\": {\"code\": -32602, \"message\": \"Invalid context\"}, \"id\": %d}";
@@ -389,7 +397,7 @@ const char parse_error[] = "{\"jsonrpc\":\"2.0\",\"id\":%d,\"error\":{\"code\":-
 
 const char resource[] = "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"logging\":{},\"tools\":{\"listChanged\":true}},\"serverInfo\":{\"name\":\"Raspberry Pi Pico Smart Home\",\"description\":\"A smart home system based on Raspberry Pi Pico.\",\"version\":\"1.0.0.0\"}}}";
 const char tool_list[] = "{\"jsonrpc\":\"2.0\",\"id\":%d,\"result\":{\"tools\":["
-		"{\"name\":\"set_switch\",\"description\":\"Use this to toggle a light or other switch ON or OFF.\",\"inputSchema\":{\"title\":\"set_switch\",\"description\":\"Use this to toggle a light or other switch ON or OFF.\",\"type\":\"object\",\"properties\":{\"switch_id\":{\"type\":\"string\"},\"location\":{\"type\":\"string\"},\"state\":{\"type\":\"string\",\"enum\":[\"on\",\"off\"]}},\"required\":[\"state\"]}},"
+		"{\"name\":\"set_switch\",\"description\":\"Trigger a momentary power button pulse.\",\"inputSchema\":{\"title\":\"set_switch\",\"description\":\"Trigger a momentary power button pulse.\",\"type\":\"object\",\"properties\":{\"switch_id\":{\"type\":\"string\"},\"location\":{\"type\":\"string\"},\"state\":{\"type\":\"string\",\"enum\":[\"on\",\"off\"]}},\"required\":[\"state\"]}},"
 		"{\"name\":\"set_location\",\"description\":\"Set the location of the switch.\",\"inputSchema\":{\"title\":\"set_location\",\"description\":\"Set the location of the switch.\",\"type\":\"object\",\"properties\":{\"switch_id\":{\"type\":\"string\"},\"location\":{\"type\":\"string\"}},\"required\":[\"location\"]}},"
 		"{\"name\":\"set_switch_id\",\"description\":\"Set the ID of the switch.\",\"inputSchema\":{\"title\":\"set_switch_id\",\"description\":\"Set the ID of the switch.\",\"type\":\"object\",\"properties\":{\"switch_id\":{\"type\":\"string\"},\"location\":{\"type\":\"string\"}},\"required\":[\"switch_id\"]}}"
 	"]}}";
@@ -450,9 +458,13 @@ void handle_set_switch(session_info_t *info, JSON_Object *arguments, int id)
 	if ((location && strcmp(location, context.location) == 0)
 		|| (switch_id && strcmp(switch_id, context.switch_id) == 0)
 		|| (!location && !switch_id)) {
-		switch_led(state);
+		LWIP_UNUSED_ARG(state);
+		if (!atx_power_pulse()) {
+			response_printf(info, pulse_busy, id);
+			return;
+		}
 		char content[256];
-		sprintf(content, "{\"switch_id\":\"%s\",\"location\":\"%s\",\"state\":\"%s\"}",
+		sprintf(content, "{\"switch_id\":\"%s\",\"location\":\"%s\",\"state\":\"%s\",\"result\":\"pulse triggered\"}",
 			context.switch_id, context.location, get_switch_state());
 		response_printf(info, call_result, content, id);
 	}
@@ -730,10 +742,10 @@ int loop()
 		if (absolute_time_diff_us(get_absolute_time(), led_time) < 0) {
 			led_time = make_timeout_time_ms(1000);
 		}
-        cyw43_arch_poll();
-        cyw43_arch_wait_for_work_until(led_time);
+		cyw43_arch_poll();
+		cyw43_arch_wait_for_work_until(led_time);
 #else
-        sleep_ms(1000);
+		sleep_ms(1000);
 #endif
 	}
 #if LWIP_MDNS_RESPONDER
@@ -757,6 +769,8 @@ int main()
 		printf("Wi-Fi init failed\n");
 		return -1;
 	}
+
+	init_atx_power_gpio();
 
 	while (true) {
 		loop();

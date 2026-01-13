@@ -1,10 +1,10 @@
 # MCP for Raspberry Pi Pico W
 
-## LED Control via JSON-RPC
+## ATX Power Button Pulse via JSON-RPC
 
 The firmware exposes JSON-RPC tools that can be invoked using the `tools/call` method. Use `tools/list` to discover available tools:
 `set_location`, `set_switch_id`, and `set_switch`.
-These allow you to configure the target switch and toggle the onboard LED.
+These allow you to configure the target switch and trigger a momentary ATX PWR_SW pulse.
 
 Example requests:
 
@@ -26,9 +26,16 @@ Example requests:
   "id": 3 }
 ```
 
-Call `set_switch` with `"state": "on"` or `"off"`. The LED changes only when the
+Call `set_switch` with `"state": "on"` or `"off"`; the state value is accepted for
+compatibility but always triggers a single pulse. The pulse fires only when the
 request's `location` or `switch_id` matches the previously set values or when
 both fields are omitted.
+
+GPIO configuration defaults (adjust in `pico_mcp.c`):
+
+- `ATX_PWR_SW_GPIO` (GPIO number)
+- `ATX_PWR_SW_ACTIVE_LEVEL` (active-high or active-low)
+- `ATX_PWR_SW_PULSE_MS` (pulse width in ms, default 200ms)
 
 ## How it works
 
